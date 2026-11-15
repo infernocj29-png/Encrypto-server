@@ -5,7 +5,8 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const app = express();
-app.use(express.static('public'));
+app.use(express.static(require('path').join(__dirname, 'public')));
+app.get('/healthz', (req, res) => res.send('ok'));
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
 
@@ -87,6 +88,9 @@ wss.on('connection', (ws) => {
     if (u && u.ws === ws) { u.ws = null; broadcast({ type: 'presence', email: me, online: false }); }
   });
 });
+
+// Keep idle WebSocket connections alive through Render's proxy.
+setInterval(() => wss.clients.forEach((c) => c.readyState === 1 && c.ping()), 30000);
 
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => console.log(`Encrypto running on http://localhost:${PORT}`));
