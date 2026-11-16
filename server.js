@@ -5,7 +5,15 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const app = express();
-app.use(express.static(require('path').join(__dirname, 'public')));
+const fs = require('fs');
+const path = require('path');
+// Serve the app from ./public, or from index.html next to server.js if that is where it was uploaded.
+const PUBLIC_DIR = path.join(__dirname, 'public');
+const INDEX_FILE = [path.join(PUBLIC_DIR, 'index.html'), path.join(__dirname, 'index.html')].find(fs.existsSync);
+app.use(express.static(PUBLIC_DIR));
+app.get('/', (req, res) => INDEX_FILE
+  ? res.sendFile(INDEX_FILE)
+  : res.status(404).send('index.html not found. Put it in a folder named "public" next to server.js.'));
 app.get('/healthz', (req, res) => res.send('ok'));
 // Public config for the browser: only the Google Client ID (not a secret).
 app.get('/config.json', (req, res) => {
