@@ -7,11 +7,18 @@ const { WebSocketServer } = require('ws');
 const app = express();
 app.use(express.static(require('path').join(__dirname, 'public')));
 app.get('/healthz', (req, res) => res.send('ok'));
+// Public config for the browser: only the Google Client ID (not a secret).
+app.get('/config.json', (req, res) => {
+  res.set('Access-Control-Allow-Origin', '*');
+  res.json({ googleClientId: GOOGLE_CLIENT_ID });
+});
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, maxPayload: 1024 * 1024 });
 
 const users = new Map(); // email -> { name, key, salt, hash, ws }
 const queue = new Map(); // email -> [message] held until the recipient connects
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const TOKENINFO = process.env.GOOGLE_TOKENINFO_URL || 'https://oauth2.googleapis.com/tokeninfo';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
 const scrypt = (pw, salt) => new Promise((res, rej) =>
@@ -21,6 +28,17 @@ const broadcast = (obj, except) => wss.clients.forEach((c) => c !== except && c.
 
 wss.on('connection', (ws) => {
   let me = null;
+
+  // Mark this socket as signed in, announce presence and flush queued messages.
+  const accept = (email, u) => {
+    me = email;
+    ws.authed = true;
+    send(ws, { type: 'ready', username: email, name: u.name });
+    send(ws, { type: 'presence', list: [...users].filter(([, x]) => x.ws && x.ws.readyState === 1).map(([e]) => e) });
+    broadcast({ type: 'presence', email, online: true }, ws);
+    for (const msg of queue.get(email) || []) send(ws, msg);
+    queue.delete(email);
+  };
 
   ws.on('message', async (raw) => {
     let m;
@@ -44,18 +62,37 @@ wss.on('connection', (ws) => {
         users.set(email, u);
       } else {
         if (!u) return fail('No account found for that email.');
+        if (!u.hash) return fail('This account uses Google sign-in. Please use the Google button.');
         if (!crypto.timingSafeEqual(await scrypt(pw, u.salt), u.hash)) return fail('Incorrect password. Please try again.');
         if (u.key !== key) return fail('This device does not hold the keys for that account.');
         u.ws = ws;
       }
-      me = email;
-      ws.authed = true;
-      send(ws, { type: 'ready', username: email, name: u.name });
-      send(ws, { type: 'presence', list: [...users].filter(([, x]) => x.ws && x.ws.readyState === 1).map(([e]) => e) });
-      broadcast({ type: 'presence', email, online: true }, ws);
-      for (const msg of queue.get(email) || []) send(ws, msg);
-      queue.delete(email);
-      return;
+      return accept(email, u);
+    }
+
+    if (m.type === 'google') {
+      if (!GOOGLE_CLIENT_ID) return fail('Google sign-in is not configured on this server.');
+      let info;
+      try {
+        const r = await fetch(TOKENINFO + '?id_token=' + encodeURIComponent(String(m.credential || '')));
+        if (!r.ok) throw new Error('bad token');
+        info = await r.json();
+      } catch { return fail('Google could not verify your sign-in. Please try again.'); }
+      const issuerOk = ['accounts.google.com', 'https://accounts.google.com'].includes(info.iss);
+      if (info.aud !== GOOGLE_CLIENT_ID || !issuerOk || String(info.email_verified) !== 'true' || !info.email) {
+        return fail('Google sign-in could not be verified.');
+      }
+      const email = String(info.email).toLowerCase();
+      const key = JSON.stringify(m.publicKey);
+      let u = users.get(email);
+      if (!u) {
+        u = { name: String(info.name || email.split('@')[0]).slice(0, 60), key, salt: null, hash: null, ws };
+        users.set(email, u);
+      } else {
+        if (u.key !== key) return fail('This device does not hold the keys for that account.');
+        u.ws = ws;
+      }
+      return accept(email, u);
     }
 
     if (!me) return;
