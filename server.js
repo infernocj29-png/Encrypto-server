@@ -5,15 +5,7 @@ const crypto = require('crypto');
 const { WebSocketServer } = require('ws');
 
 const app = express();
-const fs = require('fs');
-const path = require('path');
-// Serve the app from ./public, or from index.html next to server.js if that is where it was uploaded.
-const PUBLIC_DIR = path.join(__dirname, 'public');
-const INDEX_FILE = [path.join(PUBLIC_DIR, 'index.html'), path.join(__dirname, 'index.html')].find(fs.existsSync);
-app.use(express.static(PUBLIC_DIR));
-app.get('/', (req, res) => INDEX_FILE
-  ? res.sendFile(INDEX_FILE)
-  : res.status(404).send('index.html not found. Put it in a folder named "public" next to server.js.'));
+app.use(express.static(require('path').join(__dirname, 'public')));
 app.get('/healthz', (req, res) => res.send('ok'));
 // Public config for the browser: only the Google Client ID (not a secret).
 app.get('/config.json', (req, res) => {
@@ -137,5 +129,5 @@ wss.on('connection', (ws) => {
 // Keep idle WebSocket connections alive through Render's proxy.
 setInterval(() => wss.clients.forEach((c) => c.readyState === 1 && c.ping()), 30000);
 
-const PORT = process.env.PORT || 3000;
+const PORT = 3000;
 server.listen(PORT, () => console.log(`Encrypto running on http://localhost:${PORT}`));
