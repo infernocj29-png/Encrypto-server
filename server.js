@@ -5,6 +5,7 @@ const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { WebSocketServer } = require('ws');
+const db = require('./db');
 
 const app = express();
 // Serve the app from ./public, or from index.html next to server.js if that is where it was uploaded.
@@ -25,7 +26,6 @@ const wss = new WebSocketServer({ server, maxPayload: 2 * 1024 * 1024 });
 
 // email -> { email, name, key, salt, hash, ws, about, pic, priv, blocks, contacts, lastSeen }
 const users = new Map();
-const queue = new Map(); // email -> [message] held until the recipient connects
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
 const TOKENINFO = process.env.GOOGLE_TOKENINFO_URL || 'https://oauth2.googleapis.com/tokeninfo';
 const EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -35,6 +35,7 @@ const PIC = /^data:image\/(jpeg|png|webp);base64,[A-Za-z0-9+/=]+$/;
 
 const scrypt = (pw, salt) => new Promise((res, rej) =>
   crypto.scrypt(pw, salt, 64, (e, k) => (e ? rej(e) : res(k))));
+const persist = (u) => db.saveUser(u).catch((e) => console.error('Could not save user', u.email, e.message));
 const send = (ws, obj) => ws.readyState === 1 && ws.send(JSON.stringify(obj));
 const isOn = (u) => !!(u.ws && u.ws.readyState === 1);
 const newUser = (email, f) => ({
@@ -66,17 +67,16 @@ wss.on('connection', (ws) => {
   let me = null; // the signed-in user object
 
   // Mark this socket as signed in, announce presence and flush queued messages.
-  const accept = (u) => {
+  const accept = async (u) => {
     me = u; ws.authed = true; ws.email = u.email;
     send(ws, { type: 'ready', username: u.email, name: u.name, hasPassword: !!u.hash, about: u.about, pic: u.pic, privacy: u.priv });
     send(ws, { type: 'presence', list: [...users.values()].filter((x) => x.email !== u.email && isOn(x) && canSee(x, u.email, 'online')).map((x) => x.email) });
     announcePresence(u);
-    for (const msg of queue.get(u.email) || []) {
+    for (const msg of await db.takeQueue(u.email)) {
       send(ws, msg);
       const sender = users.get(msg.from);
       if (msg.mid && sender && isOn(sender)) send(sender.ws, { type: 'ack', mid: msg.mid, status: 'delivered' });
     }
-    queue.delete(u.email);
   };
 
   ws.on('message', async (raw) => {
@@ -98,6 +98,7 @@ wss.on('connection', (ws) => {
         if (u) return fail('An account with this email already exists. Try logging in.');
         const salt = crypto.randomBytes(16);
         u = newUser(email, { name, key, salt, hash: await scrypt(pw, salt), ws });
+        try { await db.saveUser(u); } catch (e) { console.error(e.message); return fail('Could not create your account right now. Please try again.'); }
         users.set(email, u);
       } else {
         if (!u) return fail('No account found for that email.');
@@ -126,6 +127,7 @@ wss.on('connection', (ws) => {
       let u = users.get(email);
       if (!u) {
         u = newUser(email, { name: String(info.name || email.split('@')[0]).slice(0, 60), key, ws });
+        try { await db.saveUser(u); } catch (e) { console.error(e.message); return fail('Could not create your account right now. Please try again.'); }
         users.set(email, u);
       } else {
         if (u.key !== key) return fail('This device does not hold the keys for that account.');
@@ -143,19 +145,21 @@ wss.on('connection', (ws) => {
       if (!name) return fail('Your name cannot be empty.');
       if (pic && (pic.length > 200000 || !PIC.test(pic))) return fail('That profile picture is not supported.');
       Object.assign(me, { name, about, pic });
+      persist(me);
       send(ws, { type: 'profile', ...profileOf(me, me.email) });
       return pushProfile(me);
     }
 
     if (m.type === 'privacy') {
       for (const f of FIELDS) if (LEVELS.includes(m.privacy && m.privacy[f])) me.priv[f] = m.privacy[f];
-      announcePresence(me); pushProfile(me);
+      persist(me); announcePresence(me); pushProfile(me);
       return;
     }
 
     if (m.type === 'block') {
       const e = String(m.email || '').toLowerCase();
       m.on ? me.blocks.add(e) : me.blocks.delete(e);
+      persist(me);
       return;
     }
 
@@ -165,6 +169,7 @@ wss.on('connection', (ws) => {
       if (next.length < 8 || next.length > 200) return fail('Use at least 8 characters for your new password.');
       if (!crypto.timingSafeEqual(await scrypt(String(m.current || ''), me.salt), me.hash)) return fail('Your current password is incorrect.');
       me.salt = crypto.randomBytes(16); me.hash = await scrypt(next, me.salt);
+      persist(me);
       return send(ws, { type: 'password_ok' });
     }
 
@@ -188,27 +193,30 @@ wss.on('connection', (ws) => {
       if (!target) return fail(`No account found for ${to}.`);
       const mid = typeof m.mid === 'string' ? m.mid.slice(0, 64) : null;
       if (target.blocks.has(me.email)) return mid && send(ws, { type: 'ack', mid, status: 'sent' }); // dropped silently
-      me.contacts.add(to); target.contacts.add(me.email);
+      if (!me.contacts.has(to) || !target.contacts.has(me.email)) { me.contacts.add(to); target.contacts.add(me.email); persist(me); persist(target); }
       const out = { type: 'msg', from: me.email, iv: m.iv, ct: m.ct, ts: Date.now(), mid };
       if (isOn(target)) {
         send(target.ws, out);
         if (mid) send(ws, { type: 'ack', mid, status: 'delivered' });
       } else {
-        const q = queue.get(to) || [];
-        if (q.length < 300) q.push(out);
-        queue.set(to, q);
+        try { await db.enqueue(to, out); } catch (e) { console.error('Could not queue message', e.message); return fail('Message could not be saved for delivery. Please try again.'); }
         if (mid) send(ws, { type: 'ack', mid, status: 'sent' });
       }
     }
   });
 
   ws.on('close', () => {
-    if (me && me.ws === ws) { me.ws = null; me.lastSeen = Date.now(); announcePresence(me); }
+    if (me && me.ws === ws) { me.ws = null; me.lastSeen = Date.now(); persist(me); announcePresence(me); }
   });
 });
 
 // Keep idle WebSocket connections alive through Render's proxy.
 setInterval(() => wss.clients.forEach((c) => c.readyState === 1 && c.ping()), 30000);
 
+process.on('unhandledRejection', (e) => console.error('Unhandled rejection:', e));
+
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Encrypto running on http://localhost:${PORT}`));
+db.init().then((rows) => {
+  for (const r of rows) users.set(r.email, newUser(r.email, { ...r, blocks: new Set(r.blocks), contacts: new Set(r.contacts) }));
+  server.listen(PORT, () => console.log(`Encrypto running on http://localhost:${PORT}`));
+}).catch((e) => { console.error('Could not start the database:', e.message); process.exit(1); });
